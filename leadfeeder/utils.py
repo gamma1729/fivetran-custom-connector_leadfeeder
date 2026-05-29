@@ -2,28 +2,30 @@ import requests
 from fivetran_connector_sdk import Logging as log
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import json
 
+LF_API_BASE = "https://api.leadfeeder.com/v1"
 
 session = requests.Session()
 retry_strategy = Retry(
-    total=5,                 
-    backoff_factor=2,         
-    status_forcelist=[429, 500, 502, 503, 504], 
-    allowed_methods=["GET"]
+    total=5,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
 )
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
+session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 
-def fetch_data(endpoint, params, configuration):
+
+def _request(method, endpoint, configuration, params=None, json_body=None):
+    url = f"{LF_API_BASE}/{endpoint.lstrip('/')}"
     headers = {
-        "Authorization": f"Token token={configuration.get('LEADFEEDER_API_TOKEN')}",
+        "X-Api-Key": configuration.get("LEADFEEDER_API_TOKEN"),
+        "Content-Type": "application/json",
         "User-Agent": "FivetranConnector/1.0",
     }
-    url = f"{configuration.get('LEADFEEDER_BASE_API_URL')}/{endpoint}"
-
     try:
-        response = session.get(url, headers=headers, params=params, timeout=30)
+        response = session.request(
+            method, url, headers=headers, params=params, json=json_body, timeout=30
+        )
         response.raise_for_status()
         return response.json()
     except requests.exceptions.HTTPError as e:
@@ -33,142 +35,169 @@ def fetch_data(endpoint, params, configuration):
         log.info(f"Request failed calling {url}: {e}")
         raise
 
+
+def _csv_join(value):
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if v is not None)
+    return value
+
+
+def _parse_employee_range(s):
+    if not s or not isinstance(s, str):
+        return None, None
+    s = s.strip()
+    if s.endswith("+"):
+        try:
+            return int(s[:-1]), None
+        except ValueError:
+            return None, None
+    if "-" in s:
+        lo, _, hi = s.partition("-")
+        try:
+            return int(lo), int(hi)
+        except ValueError:
+            return None, None
+    try:
+        n = int(s)
+        return n, n
+    except ValueError:
+        return None, None
+
+
+def _first_url(group):
+    if not group:
+        return None
+    for item in group:
+        if isinstance(item, dict) and item.get("url"):
+            return item["url"]
+    return None
+
+
 def fetch_visits(params, configuration):
-    visit_params = params.copy()
-    visits = []
-    visit_routs = []
-    VISITS_ENDPOINT = f'/accounts/{configuration.get("LEADFEEDER_ACCOUNT_ID")}/visits'
-    
-    while True:
-        response = fetch_data(VISITS_ENDPOINT, visit_params, configuration)
-
-        if 'data' not in response or not response['data']:
-            log.info("Reponse has no data, exiting loop")
-            break
-        
-        log.info(f"fetched {len(response['data'])} for page {visit_params['page[number]']} for visits call")
-
-        for item in response['data']:
-            visit_id = item['id']
-            visit = item['attributes']
-            # fivetran can not accept lists. Lists must be converted to strings
-            if isinstance(visit["ga_client_ids"], list):
-                visit["ga_client_ids"] = ", ".join(visit["ga_client_ids"])
-            visits.append(
-                {
-                    'visit_id': visit_id,
-                    'source': visit['source'],
-                    'medium': visit['medium'],
-                    'referring_url': visit['referring_url'],
-                    'landing_page_path': visit['landing_page_path'],
-                    'keyword': visit['keyword'],
-                    'visit_length': visit['visit_length'],
-                    'started_at': visit['started_at'],
-                    'campaign': visit['campaign'],
-                    'query_term': visit['query_term'],
-                    'lf_client_id': visit['lf_client_id'],
-                    'ga_client_ids': visit['ga_client_ids'],
-                    'country_code': visit['country_code'],
-                    'device_type': visit['device_type'],
-                    'visitor_email': visit['visitor_email'],
-                    'visitor_first_name': visit['visitor_first_name'],
-                    'visitor_last_name': visit['visitor_last_name'],
-                    'lead_id': visit['lead_id'],
-                }
-            )
-            for index, element in enumerate(visit.get('visit_route',[])):
-                visit_routs.append({
-                    'visit_id': visit_id,
-                    'page_number': index + 1,
-                    'hostname': element['hostname'],
-                    'page_path': element['page_path'],
-                    'previous_page_path': element['previous_page_path'],
-                    'time_on_page': element['time_on_page'],
-                    'page_title': element['page_title'],
-                    'page_url': element['page_url'],
-                    'display_page_name': element['display_page_name'],
-                })
-        
-        if not response.get('links', {}).get('next'):
-            log.info("No next page, exiting loop")
-            break
-        else:
-            visit_params['page[number]'] += 1
-    log.info(f'{len(visits)} visits and {len(visit_routs)} visit routs fetched sending them to be synced')
-    return {
-        'raw_leadfeeder__visits': visits,
-        'raw_leadfeeder__visit_routs': visit_routs
+    account_id = configuration.get("LEADFEEDER_ACCOUNT_ID")
+    body = {"start_date": params["start_date"], "end_date": params["end_date"]}
+    query = {
+        "account_id": account_id,
+        "page[num]": params.get("page[num]") or params.get("page[number]") or 1,
+        "page[size]": params.get("page[size]", 100),
+        "include": "company",
     }
 
+    visits, engagements = [], []
+    leads_by_id, locations_by_id = {}, {}
 
-def fetch_leads(params, configuration):
-    leads_params = params.copy()
-    leads = []
-    locations = []
-    LEADS_ENDPOINT = f'/accounts/{configuration.get("LEADFEEDER_ACCOUNT_ID")}/leads'
-    
     while True:
-        response = fetch_data(LEADS_ENDPOINT, leads_params, configuration)
-
-        if 'data' not in response or not response['data']:
-            log.info("Reponse has no data, exiting loop")
+        response = _request("POST", "/web-visits", configuration, params=query, json_body=body)
+        data = response.get("data") or []
+        if not data:
+            log.info("Response has no data, exiting loop")
             break
-        
-        log.info(f"fetched {len(response['data'])} for page {leads_params['page[number]']} for leads call")
 
-        for item in response['data']:
-            lead_id = item['id']
-            lead = item['attributes']
-            # fivetran can not accept lists. Lists must be converted to strings
-            if isinstance(lead["tags"], list):
-                lead["tags"] = ", ".join(lead["tags"])
-            leads.append(
-                {
-                    'lead_id': lead_id,
-                    'name': lead['name'],
-                    'industries': [i.get('name') for i in lead.get('industries', [])] if lead.get('industries') else None,
-                    'first_visit_date': lead['first_visit_date'],
-                    'last_visit_date': lead['last_visit_date'],
-                    'website_url': lead['website_url'],
-                    'linkedin_url': lead['linkedin_url'],
-                    'twitter_handle': lead['twitter_handle'],
-                    'facebook_url': lead['facebook_url'],
-                    'employee_count': lead['employee_count'],
-                    'employees_range_min': lead['employees_range']['min'],
-                    'employees_range_max': lead['employees_range']['max'],
-                    'crm_lead_id': lead['crm_lead_id'],
-                    'crm_organization_id': lead['crm_organization_id'],
-                    'tags':lead['tags'],
-                    'logo_url': lead['logo_url'],
-                    'business_id': lead['business_id'],
-                    'revenue': lead['revenue'],
-                    'view_in_leadfeeder': lead['view_in_leadfeeder'],
-                    'quality': lead['quality'],
-                    'location_id': item.get('relationships',{}).get('location',{}).get('data',{}).get('id')
-                }
-            )
+        log.info(f"fetched {len(data)} for page {query['page[num]']} of web-visits")
 
-        for item in response.get('included',[]):
-            location_id = item['id']
-            location = item['attributes']
-            locations.append({
-                'location_id': location_id,
-                'country': location['country'],
-                'country_code': location['country_code'],
-                'region': location['region'],
-                'region_code': location['region_code'],
-                'city': location['city'],
-                'state_code': location['state_code'],
+        for item in data:
+            visit_id = item["id"]
+            attrs = item.get("attributes") or {}
+            rels = item.get("relationships") or {}
+            ids = attrs.get("identifiers") or {}
+            visitor = attrs.get("visitor") or {}
+            location = rels.get("location") or {}
+            location_attrs = location.get("attributes") or {}
+            company = rels.get("company") or {}
+            company_attrs = company.get("attributes") or {}
+            company_id = company.get("id")
+            location_id = location.get("id")
+
+            visits.append({
+                "visit_id": visit_id,
+                "source": attrs.get("source"),
+                "medium": attrs.get("medium"),
+                "referring_url": attrs.get("referring_url"),
+                "landing_page_path": attrs.get("landing_page_path"),
+                "keyword": attrs.get("keyword"),
+                "visit_length": attrs.get("visit_length"),
+                "started_at": attrs.get("started_at"),
+                "campaign": attrs.get("campaign"),
+                "page_depth": attrs.get("page_depth"),
+                "device_type": attrs.get("device_type"),
+                "lf_client_id": ids.get("lf_client_id"),
+                "ga_client_ids": _csv_join(ids.get("ga_client_ids")),
+                "country_code": location_attrs.get("country_code"),
+                "visitor_email": visitor.get("email"),
+                "visitor_first_name": visitor.get("first_name"),
+                "visitor_last_name": visitor.get("last_name"),
+                "lead_id": company_id,
+                "location_id": location_id,
+                "account_id": str(account_id) if account_id is not None else None,
             })
-        
-        if not response.get('links', {}).get('next'):
-            log.info("No next page, exiting loop")
+
+            for idx, eng in enumerate(attrs.get("engagements") or []):
+                page = eng.get("page") or {}
+                engagements.append({
+                    "visit_id": visit_id,
+                    "page_number": idx + 1,
+                    "event_type": eng.get("event_type"),
+                    "hostname": eng.get("hostname"),
+                    "page_path": page.get("path"),
+                    "page_title": page.get("title"),
+                    "page_url": page.get("url"),
+                    "previous_page_path": eng.get("previous_page_path"),
+                    "time_on_page": eng.get("time_on_page"),
+                    "has_met_goals": eng.get("has_met_goals"),
+                })
+
+            if location_id and location_id not in locations_by_id:
+                locations_by_id[location_id] = {
+                    "location_id": location_id,
+                    "country": location_attrs.get("country"),
+                    "country_code": location_attrs.get("country_code"),
+                    "region": location_attrs.get("region"),
+                    "city": location_attrs.get("city"),
+                    "postal_code": location_attrs.get("postal_code"),
+                }
+
+            if company_id and company_id not in leads_by_id:
+                socials = company_attrs.get("social_media_profiles") or {}
+                emp_min, emp_max = _parse_employee_range(company_attrs.get("employee_range"))
+                industries_list = (company_attrs.get("industries") or {}).get("industry") or []
+                industries_str = ", ".join(
+                    i.get("name") for i in industries_list if i.get("name")
+                )
+                revenue = company_attrs.get("revenue") or {}
+                web_eng = company_attrs.get("web_engagement") or {}
+                leads_by_id[company_id] = {
+                    "lead_id": company_id,
+                    "name": company_attrs.get("name"),
+                    "last_visit_date": web_eng.get("last_visit_date"),
+                    "website_url": company_attrs.get("url"),
+                    "linkedin_url": _first_url(socials.get("linkedin")),
+                    "twitter_handle": _first_url(socials.get("twitter")),
+                    "facebook_url": _first_url(socials.get("facebook")),
+                    "employee_count": company_attrs.get("employee_count"),
+                    "employees_range_min": emp_min,
+                    "employees_range_max": emp_max,
+                    "logo_url": company_attrs.get("logo_url"),
+                    "business_id": company_attrs.get("vat_id"),
+                    "revenue": str(revenue.get("value")) if revenue.get("value") is not None else None,
+                    "industries": industries_str,
+                    "location_id": location_id,
+                }
+
+        pagination = (response.get("meta") or {}).get("pagination") or {}
+        page_num = pagination.get("page_num")
+        page_count = pagination.get("page_count")
+        if page_num is None or page_count is None or page_num >= page_count:
+            log.info("No more pages, exiting loop")
             break
-        else:
-            leads_params['page[number]'] += 1
-    
-    log.info(f"Fetched total {len(leads)} leads and {len(locations)} locations.")
+        query["page[num]"] = page_num + 1
+
+    log.info(
+        f"{len(visits)} visits, {len(engagements)} engagements, "
+        f"{len(leads_by_id)} leads, {len(locations_by_id)} locations fetched"
+    )
     return {
-        'raw_leadfeeder__locations': locations,
-        'raw_leadfeeder__leads': leads
+        "raw_leadfeeder__visits": visits,
+        "raw_leadfeeder__visit_routs": engagements,
+        "raw_leadfeeder__leads": list(leads_by_id.values()),
+        "raw_leadfeeder__locations": list(locations_by_id.values()),
     }

@@ -1,6 +1,6 @@
 from fivetran_connector_sdk import Connector, Operations as op, Logging as log
 from datetime import datetime, timedelta
-from utils import fetch_visits, fetch_leads
+from utils import fetch_visits
 from state import get_state, update_state
 from schema import get_schema
 
@@ -8,14 +8,6 @@ def schema(configuration):
     return get_schema(configuration)
 
 
-
-def update_leads(configuration, state):
-    yield from sync_records(
-        fetch_function= fetch_leads,
-        state= state,
-        table_to_update= 'raw_leadfeeder__leads',
-        configuration= configuration
-    )
 
 def update_visits(configuration, state):
     yield from sync_records(
@@ -45,7 +37,7 @@ def sync_records(configuration, fetch_function, state, table_to_update):
         params = {
             'start_date': start_date.strftime("%Y-%m-%d"),
             'end_date': start_date.strftime("%Y-%m-%d"),
-            'page[number]': 1,
+            'page[num]': 1,
             'page[size]': int(configuration.get("page_size", 100))
         }
         records_to_upsert = fetch_function(params, configuration)
@@ -66,7 +58,6 @@ def sync_records(configuration, fetch_function, state, table_to_update):
 
 def update(configuration, state):
     yield from update_visits(configuration, state)
-    yield from update_leads(configuration, state)
 
 connector = Connector(schema=schema, update=update)
 
